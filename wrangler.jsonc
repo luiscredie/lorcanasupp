@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lorcana",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-09",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "GH_OWNER": "luiscredie",
+    "GH_REPO": "lorcana",
+    "GH_BRANCH": "main",
+    "GH_PATH": "atlas-data.json"
+  }
+}
