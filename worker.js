@@ -1,5 +1,5 @@
 // Ranger Atlas save server — Cloudflare Worker (free).
-// Holds your GitHub token AND admin password as SECRETS so no browser ever sees them.
+// Holds your GitHub token AND all account passwords as SECRETS so no browser ever sees them.
 //
 // SETUP (one time, ~4 min):
 // 1. Make a fine-grained GitHub token: github.com -> Settings -> Developer settings ->
@@ -9,17 +9,22 @@
 //    Worker) -> "Edit code", paste THIS whole file (replacing what's there), Deploy.
 // 3. Worker -> Settings -> Variables and Secrets -> Add these SECRETS:
 //      GH_TOKEN        = your GitHub token from step 1
-//      ADMIN_USER      = luiscredie
-//      ADMIN_PASS      = lorcanamaster123
 //      SESSION_SECRET  = any long random string you make up (used only to sign login
 //                        sessions — never shown anywhere; e.g. mash your keyboard for 40+ chars)
-//    (Optional plain vars: GH_OWNER, GH_REPO, GH_BRANCH, GH_PATH — defaults below.)
+//      USERS           = a JSON object mapping username -> {"pass":"...","role":"admin"|"viewer"}
+//                        e.g. {"luiscredie":{"pass":"lorcanamaster123","role":"admin"},
+//                              "friend":{"pass":"someotherpassword","role":"viewer"}}
+//                        "admin" accounts can save changes; "viewer" accounts can only sign
+//                        in to view the site. Add as many entries as you like — this is the
+//                        multi-login table.
+//    (Optional legacy fallback if you don't set USERS: ADMIN_USER + ADMIN_PASS, treated as a
+//    single admin account. Optional plain vars: GH_OWNER, GH_REPO, GH_BRANCH, GH_PATH — defaults below.)
 // 4. Deploy. That's it — the same Worker URL you already pasted into the app's Sync
-//    panel keeps working; it now also handles admin login.
+//    panel keeps working; it now also handles login for the whole site.
 //
-// Reads (GET) stay open to everyone, no login needed. Writes (POST, other than the
-// login action) now REQUIRE a valid session token, checked here on the server — a
-// browser can never bypass this by editing the page's JavaScript.
+// The whole site now requires signing in (any account in USERS) just to view it. Writes
+// (POST, other than the login action) additionally REQUIRE a session whose role is "admin" —
+// checked here on the server, so a browser can never bypass this by editing the page's JS.
 
 const CFG = (env) => ({
   owner:  env.GH_OWNER  || "luiscredie",
@@ -56,15 +61,36 @@ function timingSafeEqual(a, b) {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+// Token format: "<exp>.<role>.<hexSignature>" — signature covers "<exp>.<role>" so a client
+// can never forge or upgrade its own role.
 async function verifyToken(token, secret) {
-  if (!token || !secret) return false;
-  const dot = token.lastIndexOf(".");
-  if (dot < 0) return false;
-  const expStr = token.slice(0, dot), sig = token.slice(dot + 1);
+  const info = await decodeToken(token, secret);
+  return !!info;
+}
+async function decodeToken(token, secret) {
+  if (!token || !secret) return null;
+  const parts = String(token).split(".");
+  if (parts.length !== 3) return null;
+  const [expStr, role, sig] = parts;
   const exp = parseInt(expStr, 10);
-  if (!exp || Date.now() > exp) return false;
-  const expected = await hmacHex(secret, expStr);
-  return timingSafeEqual(expected, sig);
+  if (!exp || Date.now() > exp) return null;
+  const expected = await hmacHex(secret, expStr + "." + role);
+  if (!timingSafeEqual(expected, sig)) return null;
+  return { exp, role };
+}
+function loadUsers(env) {
+  // Preferred: USERS secret, a JSON map of username -> {pass, role}.
+  if (env.USERS) {
+    try {
+      const parsed = JSON.parse(env.USERS);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch (e) {}
+  }
+  // Legacy fallback: single admin account from ADMIN_USER/ADMIN_PASS.
+  if (env.ADMIN_USER && env.ADMIN_PASS) {
+    return { [env.ADMIN_USER]: { pass: env.ADMIN_PASS, role: "admin" } };
+  }
+  return null;
 }
 
 export default {
@@ -95,24 +121,28 @@ export default {
       if (request.method === "POST") {
         const body = await request.json().catch(() => ({}));
 
-        // ---- Admin login: checked against secrets, never against anything client-visible ----
+        // ---- Login: checked against secrets, never against anything client-visible ----
         if (body && body.action === "login") {
-          if (!env.ADMIN_USER || !env.ADMIN_PASS || !env.SESSION_SECRET) {
-            return json({ error: "server missing admin secrets (ADMIN_USER/ADMIN_PASS/SESSION_SECRET)" }, 500, origin);
+          const users = loadUsers(env);
+          if (!users || !env.SESSION_SECRET) {
+            return json({ error: "server missing login secrets (USERS or ADMIN_USER/ADMIN_PASS, plus SESSION_SECRET)" }, 500, origin);
           }
-          const userOk = typeof body.user === "string" && timingSafeEqual(body.user, env.ADMIN_USER);
-          const passOk = typeof body.pass === "string" && timingSafeEqual(body.pass, env.ADMIN_PASS);
-          if (!userOk || !passOk) return json({ error: "invalid username or password" }, 401, origin);
+          const user = typeof body.user === "string" ? body.user : "";
+          const pass = typeof body.pass === "string" ? body.pass : "";
+          const account = Object.prototype.hasOwnProperty.call(users, user) ? users[user] : null;
+          const passOk = !!account && typeof account.pass === "string" && timingSafeEqual(pass, account.pass);
+          if (!account || !passOk) return json({ error: "invalid username or password" }, 401, origin);
+          const role = account.role === "admin" ? "admin" : "viewer";
           const exp = Date.now() + SESSION_MS;
-          const sig = await hmacHex(env.SESSION_SECRET, String(exp));
-          return json({ token: exp + "." + sig, exp }, 200, origin);
+          const sig = await hmacHex(env.SESSION_SECRET, exp + "." + role);
+          return json({ token: exp + "." + role + "." + sig, exp, role }, 200, origin);
         }
 
-        // ---- Write: requires a valid, unexpired session token from the login step above ----
+        // ---- Write: requires a valid, unexpired session token with the "admin" role ----
         const authHeader = request.headers.get("Authorization") || "";
         const token = authHeader.replace(/^Bearer\s+/i, "");
-        const authed = await verifyToken(token, env.SESSION_SECRET || "");
-        if (!authed) return json({ error: "unauthorized — log in as admin to save" }, 401, origin);
+        const session = await decodeToken(token, env.SESSION_SECRET || "");
+        if (!session || session.role !== "admin") return json({ error: "unauthorized — log in as admin to save" }, 401, origin);
 
         if (!env.GH_TOKEN) return json({ error: "server missing GH_TOKEN secret" }, 500, origin);
         if (typeof body.content !== "string") return json({ error: "no content" }, 400, origin);
