@@ -16,22 +16,41 @@
 //                              "friend":{"pass":"someotherpassword","role":"viewer"}}
 //                        "admin" accounts can save changes; "viewer" accounts can only sign
 //                        in to view the site. Add as many entries as you like — this is the
-//                        multi-login table.
+//                        multi-login table. Each username automatically gets its own private
+//                        data file (data/&lt;username&gt;.json) — nobody shares decks, games or
+//                        collection with anybody else. Optional: add "file":"some/path.json"
+//                        to an account to point it at a specific file instead.
 //    (Optional legacy fallback if you don't set USERS: ADMIN_USER + ADMIN_PASS, treated as a
 //    single admin account. Optional plain vars: GH_OWNER, GH_REPO, GH_BRANCH, GH_PATH — defaults below.)
 // 4. Deploy. That's it — the same Worker URL you already pasted into the app's Sync
 //    panel keeps working; it now also handles login for the whole site.
 //
-// The whole site now requires signing in (any account in USERS) just to view it. Writes
-// (POST, other than the login action) additionally REQUIRE a session whose role is "admin" —
-// checked here on the server, so a browser can never bypass this by editing the page's JS.
+// The whole site now requires signing in (any account in USERS) just to view it. Each
+// account gets its OWN data file on GitHub — decks, games, and collection never mix between
+// users. Writes (POST, other than the login action) additionally REQUIRE a session whose
+// role is "admin" — checked here on the server, so a browser can never bypass this by
+// editing the page's JS, and a viewer/admin token can never be swapped to read someone
+// else's file (the username is baked into and verified from the signed token).
 
 const CFG = (env) => ({
   owner:  env.GH_OWNER  || "luiscredie",
   repo:   env.GH_REPO   || "lorcana",
   branch: env.GH_BRANCH || "main",
-  path:   env.GH_PATH   || "atlas-data.json",
+  defaultPath: env.GH_PATH || "atlas-data.json",
 });
+// Each account gets its own data file, so decks/games/collection never mix between users.
+// Override per-account via a "file" field in USERS; otherwise: the very first/legacy admin
+// keeps the original atlas-data.json (so existing data isn't orphaned), everyone else gets
+// data/<username>.json.
+function safeUserKey(user) {
+  return String(user || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+}
+function fileForUser(env, user, account) {
+  if (account && typeof account.file === "string" && account.file) return account.file;
+  const key = safeUserKey(user);
+  if (key === "luiscredie") return CFG(env).defaultPath;
+  return "data/" + (key || "user") + ".json";
+}
 const ALLOW = "https://luiscredie.github.io"; // set to "*" to allow any origin
 const SESSION_MS = 60 * 60 * 1000; // 1 hour
 
@@ -61,8 +80,19 @@ function timingSafeEqual(a, b) {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
-// Token format: "<exp>.<role>.<hexSignature>" — signature covers "<exp>.<role>" so a client
-// can never forge or upgrade its own role.
+// Token format: "<exp>.<role>.<b64urlUser>.<hexSignature>" — signature covers
+// "<exp>.<role>.<b64urlUser>" so a client can never forge or upgrade its own role or
+// impersonate another account's stored file.
+function b64urlEncode(s) {
+  return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s) {
+  try {
+    let t = String(s).replace(/-/g, "+").replace(/_/g, "/");
+    while (t.length % 4) t += "=";
+    return decodeURIComponent(escape(atob(t)));
+  } catch (e) { return ""; }
+}
 async function verifyToken(token, secret) {
   const info = await decodeToken(token, secret);
   return !!info;
@@ -70,13 +100,15 @@ async function verifyToken(token, secret) {
 async function decodeToken(token, secret) {
   if (!token || !secret) return null;
   const parts = String(token).split(".");
-  if (parts.length !== 3) return null;
-  const [expStr, role, sig] = parts;
+  if (parts.length !== 4) return null;
+  const [expStr, role, userEnc, sig] = parts;
   const exp = parseInt(expStr, 10);
   if (!exp || Date.now() > exp) return null;
-  const expected = await hmacHex(secret, expStr + "." + role);
+  const expected = await hmacHex(secret, expStr + "." + role + "." + userEnc);
   if (!timingSafeEqual(expected, sig)) return null;
-  return { exp, role };
+  const user = b64urlDecode(userEnc);
+  if (!user) return null;
+  return { exp, role, user };
 }
 function loadUsers(env) {
   // Preferred: USERS secret, a JSON map of username -> {pass, role}.
@@ -92,6 +124,13 @@ function loadUsers(env) {
   }
   return null;
 }
+function ghHeaders(env) {
+  return {
+    "Authorization": "Bearer " + env.GH_TOKEN,
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "ranger-atlas-worker",
+  };
+}
 
 export default {
   async fetch(request, env) {
@@ -99,16 +138,19 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(origin) });
 
     const c = CFG(env);
-    const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + c.path;
-    const gh = (extra) => ({
-      "Authorization": "Bearer " + env.GH_TOKEN,
-      "Accept": "application/vnd.github+json",
-      "User-Agent": "ranger-atlas-worker",
-      ...(extra || {}),
-    });
+    const gh = (extra) => ({ ...ghHeaders(env), ...(extra || {}) });
 
     try {
       if (request.method === "GET") {
+        // Reads are per-account too — a valid session (any role) is required so the server
+        // can resolve which file belongs to the caller. No token, no data.
+        const authHeader = request.headers.get("Authorization") || "";
+        const token = authHeader.replace(/^Bearer\s+/i, "");
+        const session = await decodeToken(token, env.SESSION_SECRET || "");
+        if (!session) return json({ error: "unauthorized — log in to view" }, 401, origin);
+        const users = loadUsers(env) || {};
+        const file = fileForUser(env, session.user, users[session.user]);
+        const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + file;
         const r = await fetch(api + "?ref=" + c.branch + "&t=" + Date.now(), { headers: gh() });
         if (r.status === 404) return json({ doc: null, sha: null }, 200, origin);
         if (!r.ok) return json({ error: "read " + r.status }, 502, origin);
@@ -134,8 +176,9 @@ export default {
           if (!account || !passOk) return json({ error: "invalid username or password" }, 401, origin);
           const role = account.role === "admin" ? "admin" : "viewer";
           const exp = Date.now() + SESSION_MS;
-          const sig = await hmacHex(env.SESSION_SECRET, exp + "." + role);
-          return json({ token: exp + "." + role + "." + sig, exp, role }, 200, origin);
+          const userEnc = b64urlEncode(user);
+          const sig = await hmacHex(env.SESSION_SECRET, exp + "." + role + "." + userEnc);
+          return json({ token: exp + "." + role + "." + userEnc + "." + sig, exp, role, user }, 200, origin);
         }
 
         // ---- Write: requires a valid, unexpired session token with the "admin" role ----
@@ -146,8 +189,11 @@ export default {
 
         if (!env.GH_TOKEN) return json({ error: "server missing GH_TOKEN secret" }, 500, origin);
         if (typeof body.content !== "string") return json({ error: "no content" }, 400, origin);
+        const users = loadUsers(env) || {};
+        const file = fileForUser(env, session.user, users[session.user]);
+        const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + file;
         const put = {
-          message: "Ranger Atlas sync " + new Date().toISOString(),
+          message: "Ranger Atlas sync (" + session.user + ") " + new Date().toISOString(),
           content: btoa(unescape(encodeURIComponent(body.content))),
           branch: c.branch,
         };
