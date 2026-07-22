@@ -20,6 +20,11 @@
 //                        data file (data/&lt;username&gt;.json) — nobody shares decks, games or
 //                        collection with anybody else. Optional: add "file":"some/path.json"
 //                        to an account to point it at a specific file instead.
+//    OPTIONAL — accounts without redeploy: bind a KV namespace named USERS_KV
+//    (Worker -> Settings -> Bindings -> KV). Add one key per username, value =
+//    {"pass":"...","role":"admin"|"viewer"} (optional "file"). KV rows are checked
+//    before USERS, so you can add/remove users live without editing a secret or
+//    redeploying. USERS stays as the fallback/seed table.
 //    (Optional legacy fallback if you don't set USERS: ADMIN_USER + ADMIN_PASS, treated as a
 //    single admin account. Optional plain vars: GH_OWNER, GH_REPO, GH_BRANCH, GH_PATH — defaults below.)
 // 4. Deploy. That's it — the same Worker URL you already pasted into the app's Sync
@@ -124,6 +129,20 @@ function loadUsers(env) {
   }
   return null;
 }
+// KV-backed accounts (optional): bind a KV namespace named USERS_KV in the Worker settings.
+// Each key is a username, each value is JSON {"pass":"...","role":"admin"|"viewer","file":"..."}.
+// This lets you add/remove users WITHOUT editing a secret and redeploying — just add a KV row.
+// KV takes precedence over the USERS secret when an account exists in both.
+async function lookupAccount(env, user) {
+  if (env.USERS_KV && user) {
+    try {
+      const raw = await env.USERS_KV.get(user);
+      if (raw) { const a = JSON.parse(raw); if (a && typeof a === "object") return a; }
+    } catch (e) {}
+  }
+  const users = loadUsers(env) || {};
+  return Object.prototype.hasOwnProperty.call(users, user) ? users[user] : null;
+}
 function ghHeaders(env) {
   return {
     "Authorization": "Bearer " + env.GH_TOKEN,
@@ -148,8 +167,8 @@ export default {
         const token = authHeader.replace(/^Bearer\s+/i, "");
         const session = await decodeToken(token, env.SESSION_SECRET || "");
         if (!session) return json({ error: "unauthorized — log in to view" }, 401, origin);
-        const users = loadUsers(env) || {};
-        const file = fileForUser(env, session.user, users[session.user]);
+        const account = await lookupAccount(env, session.user);
+        const file = fileForUser(env, session.user, account);
         const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + file;
         const r = await fetch(api + "?ref=" + c.branch + "&t=" + Date.now(), { headers: gh() });
         if (r.status === 404) return json({ doc: null, sha: null }, 200, origin);
@@ -171,7 +190,7 @@ export default {
           }
           const user = typeof body.user === "string" ? body.user : "";
           const pass = typeof body.pass === "string" ? body.pass : "";
-          const account = Object.prototype.hasOwnProperty.call(users, user) ? users[user] : null;
+          const account = await lookupAccount(env, user);
           const passOk = !!account && typeof account.pass === "string" && timingSafeEqual(pass, account.pass);
           if (!account || !passOk) return json({ error: "invalid username or password" }, 401, origin);
           const role = account.role === "admin" ? "admin" : "viewer";
@@ -189,8 +208,8 @@ export default {
 
         if (!env.GH_TOKEN) return json({ error: "server missing GH_TOKEN secret" }, 500, origin);
         if (typeof body.content !== "string") return json({ error: "no content" }, 400, origin);
-        const users = loadUsers(env) || {};
-        const file = fileForUser(env, session.user, users[session.user]);
+        const account = await lookupAccount(env, session.user);
+        const file = fileForUser(env, session.user, account);
         const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + file;
         const put = {
           message: "Ranger Atlas sync (" + session.user + ") " + new Date().toISOString(),
