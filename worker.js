@@ -11,18 +11,18 @@
 //      GH_TOKEN        = your GitHub token from step 1
 //      SESSION_SECRET  = any long random string you make up (used only to sign login
 //                        sessions — never shown anywhere; e.g. mash your keyboard for 40+ chars)
-//      USERS           = a JSON object mapping username -> {"pass":"...","role":"admin"|"viewer"}
-//                        e.g. {"luiscredie":{"pass":"lorcanamaster123","role":"admin"},
-//                              "friend":{"pass":"someotherpassword","role":"viewer"}}
-//                        "admin" accounts can save changes; "viewer" accounts can only sign
-//                        in to view the site. Add as many entries as you like — this is the
-//                        multi-login table. Each username automatically gets its own private
+//      USERS           = a JSON object mapping username -> {"pass":"...","role":"admin"|"editor"|"viewer"}
+//                        e.g. {"luiscredie":{"pass":"use-a-strong-password","role":"admin"},
+//                              "friend":{"pass":"another-strong-password","role":"editor"}}
+//                        "admin" and "editor" accounts can save their OWN data file;
+//                        "viewer" accounts can only view. Add as many entries as you like — this is the
+//                        multi-login table. Each username automatically gets its own separate
 //                        data file (data/&lt;username&gt;.json) — nobody shares decks, games or
 //                        collection with anybody else. Optional: add "file":"some/path.json"
 //                        to an account to point it at a specific file instead.
 //    OPTIONAL — accounts without redeploy: bind a KV namespace named USERS_KV
 //    (Worker -> Settings -> Bindings -> KV). Add one key per username, value =
-//    {"pass":"...","role":"admin"|"viewer"} (optional "file"). KV rows are checked
+//    {"pass":"...","role":"admin"|"editor"|"viewer"} (optional "file"). KV rows are checked
 //    before USERS, so you can add/remove users live without editing a secret or
 //    redeploying. USERS stays as the fallback/seed table.
 //    (Optional legacy fallback if you don't set USERS: ADMIN_USER + ADMIN_PASS, treated as a
@@ -33,8 +33,8 @@
 // The whole site now requires signing in (any account in USERS) just to view it. Each
 // account gets its OWN data file on GitHub — decks, games, and collection never mix between
 // users. Writes (POST, other than the login action) additionally REQUIRE a session whose
-// role is "admin" — checked here on the server, so a browser can never bypass this by
-// editing the page's JS, and a viewer/admin token can never be swapped to read someone
+// role is "admin" or "editor" — checked here on the server, so a browser can never bypass
+// this by editing the page's JS, and a token can never be swapped to read someone
 // else's file (the username is baked into and verified from the signed token).
 
 const CFG = (env) => ({
@@ -50,8 +50,17 @@ const CFG = (env) => ({
 function safeUserKey(user) {
   return String(user || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
 }
+function isCanonicalUser(user) {
+  return typeof user === "string"
+    && user.length >= 1
+    && user.length <= 64
+    && user === safeUserKey(user);
+}
 function fileForUser(env, user, account) {
-  if (account && typeof account.file === "string" && account.file) return account.file;
+  if (account && typeof account.file === "string" && account.file) {
+    const file = account.file.trim();
+    if (!file.startsWith("/") && !file.split("/").includes("..") && /^[a-zA-Z0-9._/-]+$/.test(file)) return file;
+  }
   const key = safeUserKey(user);
   if (key === "luiscredie") return CFG(env).defaultPath;
   return "data/" + (key || "user") + ".json";
@@ -112,7 +121,7 @@ async function decodeToken(token, secret) {
   const expected = await hmacHex(secret, expStr + "." + role + "." + userEnc);
   if (!timingSafeEqual(expected, sig)) return null;
   const user = b64urlDecode(userEnc);
-  if (!user) return null;
+  if (!isCanonicalUser(user)) return null;
   return { exp, role, user };
 }
 function loadUsers(env) {
@@ -130,7 +139,7 @@ function loadUsers(env) {
   return null;
 }
 // KV-backed accounts (optional): bind a KV namespace named USERS_KV in the Worker settings.
-// Each key is a username, each value is JSON {"pass":"...","role":"admin"|"viewer","file":"..."}.
+// Each key is a username, each value is JSON {"pass":"...","role":"admin"|"editor"|"viewer","file":"..."}.
 // This lets you add/remove users WITHOUT editing a secret and redeploying — just add a KV row.
 // KV takes precedence over the USERS secret when an account exists in both.
 async function lookupAccount(env, user) {
@@ -168,6 +177,7 @@ export default {
         const session = await decodeToken(token, env.SESSION_SECRET || "");
         if (!session) return json({ error: "unauthorized — log in to view" }, 401, origin);
         const account = await lookupAccount(env, session.user);
+        if (!account) return json({ error: "account no longer exists" }, 401, origin);
         const file = fileForUser(env, session.user, account);
         const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + file;
         const r = await fetch(api + "?ref=" + c.branch + "&t=" + Date.now(), { headers: gh() });
@@ -185,30 +195,36 @@ export default {
         // ---- Login: checked against secrets, never against anything client-visible ----
         if (body && body.action === "login") {
           const users = loadUsers(env);
-          if (!users || !env.SESSION_SECRET) {
-            return json({ error: "server missing login secrets (USERS or ADMIN_USER/ADMIN_PASS, plus SESSION_SECRET)" }, 500, origin);
+          if ((!users && !env.USERS_KV) || !env.SESSION_SECRET) {
+            return json({ error: "server missing account storage (USERS, USERS_KV or legacy ADMIN_USER/ADMIN_PASS) and SESSION_SECRET" }, 500, origin);
           }
           const user = typeof body.user === "string" ? body.user : "";
           const pass = typeof body.pass === "string" ? body.pass : "";
+          if (!isCanonicalUser(user)) {
+            return json({ error: "invalid username or password" }, 401, origin);
+          }
           const account = await lookupAccount(env, user);
           const passOk = !!account && typeof account.pass === "string" && timingSafeEqual(pass, account.pass);
           if (!account || !passOk) return json({ error: "invalid username or password" }, 401, origin);
-          const role = account.role === "admin" ? "admin" : "viewer";
+          const role = account.role === "admin" ? "admin" : (account.role === "editor" ? "editor" : "viewer");
           const exp = Date.now() + SESSION_MS;
           const userEnc = b64urlEncode(user);
           const sig = await hmacHex(env.SESSION_SECRET, exp + "." + role + "." + userEnc);
           return json({ token: exp + "." + role + "." + userEnc + "." + sig, exp, role, user }, 200, origin);
         }
 
-        // ---- Write: requires a valid, unexpired session token with the "admin" role ----
+        // ---- Write: requires a valid editor/admin session, scoped to its own account file ----
         const authHeader = request.headers.get("Authorization") || "";
         const token = authHeader.replace(/^Bearer\s+/i, "");
         const session = await decodeToken(token, env.SESSION_SECRET || "");
-        if (!session || session.role !== "admin") return json({ error: "unauthorized — log in as admin to save" }, 401, origin);
+        if (!session || (session.role !== "admin" && session.role !== "editor")) return json({ error: "unauthorized — editing permission required" }, 401, origin);
 
         if (!env.GH_TOKEN) return json({ error: "server missing GH_TOKEN secret" }, 500, origin);
         if (typeof body.content !== "string") return json({ error: "no content" }, 400, origin);
         const account = await lookupAccount(env, session.user);
+        if (!account) return json({ error: "account no longer exists" }, 401, origin);
+        const currentRole = account.role === "admin" ? "admin" : (account.role === "editor" ? "editor" : "viewer");
+        if (currentRole !== "admin" && currentRole !== "editor") return json({ error: "editing permission was removed" }, 403, origin);
         const file = fileForUser(env, session.user, account);
         const api = "https://api.github.com/repos/" + c.owner + "/" + c.repo + "/contents/" + file;
         const put = {
